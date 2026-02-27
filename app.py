@@ -3,6 +3,10 @@ PdfInfoEx – PDF Extraction & Testing Dashboard
 ================================================
 Streamlit UI that orchestrates PDF detection, text/image extraction,
 token comparison, and LLM-based document processing.
+
+Two-step flow:
+  1. Process  → extract text or convert to images (no API key needed)
+  2. Query    → send processed content to an LLM
 """
 
 from __future__ import annotations
@@ -32,7 +36,7 @@ st.set_page_config(
 )
 
 # ---------------------------------------------------------------------------
-# Cached wrappers (Streamlit cache decorators must live in the app module)
+# Cached wrappers
 # ---------------------------------------------------------------------------
 @st.cache_data(show_spinner=False)
 def _cached_detect(pdf_bytes: bytes):
@@ -51,6 +55,19 @@ def _cached_pdf_to_images(pdf_bytes: bytes) -> list[bytes]:
     return pdf_to_images(pdf_bytes)
 
 # ---------------------------------------------------------------------------
+# Session state defaults
+# ---------------------------------------------------------------------------
+for key, default in [
+    ("doc_type", None),
+    ("avg_chars", 0.0),
+    ("processed_text", None),
+    ("processed_images", None),
+    ("is_processed", False),
+]:
+    if key not in st.session_state:
+        st.session_state[key] = default
+
+# ---------------------------------------------------------------------------
 # UI: Title
 # ---------------------------------------------------------------------------
 st.title("📄 PdfInfoEx – PDF Extraction Dashboard")
@@ -61,11 +78,12 @@ st.caption("Auto-detect PDF type · Compare extraction methods & tokens · Route
 # ---------------------------------------------------------------------------
 uploaded_file = st.file_uploader("Upload a PDF", type=["pdf"])
 
-# Session state defaults
-if "doc_type" not in st.session_state:
+# Reset processing state when a new file is uploaded (or removed)
+if uploaded_file is None:
     st.session_state.doc_type = None
-if "avg_chars" not in st.session_state:
-    st.session_state.avg_chars = 0.0
+    st.session_state.is_processed = False
+    st.session_state.processed_text = None
+    st.session_state.processed_images = None
 
 # ---------------------------------------------------------------------------
 # Auto-detection on upload
@@ -91,24 +109,13 @@ if uploaded_file is not None:
 doc_type = st.session_state.doc_type
 
 # ---------------------------------------------------------------------------
-# UI: Sidebar configuration
+# UI: Sidebar — extraction config + LLM provider
 # ---------------------------------------------------------------------------
 with st.sidebar:
     st.header("⚙️ Configuration")
 
-    provider = st.selectbox("LLM Provider", ["OpenAI", "Gemini", "Anthropic"])
-    api_key = st.text_input(f"{provider} API Key", type="password")
-
-    # Dynamic model selection
-    if doc_type:
-        recommended = MODEL_MAP[provider][doc_type]
-        st.selectbox("Model", [recommended], disabled=True, help="Auto-selected based on document type")
-    else:
-        st.selectbox("Model", ["Upload a PDF first"], disabled=True)
-
-    st.divider()
-
-    # Extraction method
+    # --- Extraction method ---
+    st.subheader("Extraction")
     if doc_type == "Digital":
         extraction_method = st.radio(
             "Extraction Method",
@@ -128,12 +135,16 @@ with st.sidebar:
 
     st.divider()
 
-    # Query mode
-    query_mode = st.radio("Query Mode", ["Default JSON Extraction", "Manual Query"])
-    if query_mode == "Manual Query":
-        custom_prompt = st.text_area("Your prompt", height=120, placeholder="Ask anything about the document…")
+    # --- LLM provider config ---
+    st.subheader("LLM Provider")
+    provider = st.selectbox("Provider", ["OpenAI", "Gemini", "Anthropic"])
+    api_key = st.text_input(f"{provider} API Key", type="password")
+
+    if doc_type:
+        recommended = MODEL_MAP[provider][doc_type]
+        st.selectbox("Model", [recommended], disabled=True, help="Auto-selected based on document type")
     else:
-        custom_prompt = None
+        st.selectbox("Model", ["Upload a PDF first"], disabled=True)
 
 # ---------------------------------------------------------------------------
 # UI: Token comparison (expandable)
@@ -161,12 +172,79 @@ if uploaded_file is not None:
             )
 
 # ---------------------------------------------------------------------------
-# UI: Process button & execution
+# Step 1: Process Document (extract text / convert to images — no API key)
 # ---------------------------------------------------------------------------
-if uploaded_file is not None:
+if uploaded_file is not None and not st.session_state.is_processed:
     st.divider()
 
     if st.button("🚀 Process Document", type="primary", use_container_width=True):
+        if doc_type == "Digital":
+            with st.spinner("Extracting text …"):
+                if extraction_method and extraction_method.startswith("pdfminer"):
+                    st.session_state.processed_text = _cached_extract_pdfminer(pdf_bytes)
+                else:
+                    st.session_state.processed_text = _cached_extract_pymupdf4llm(pdf_bytes)
+            st.session_state.processed_images = None
+        else:
+            with st.spinner("Converting PDF to images …"):
+                st.session_state.processed_images = _cached_pdf_to_images(pdf_bytes)
+            st.session_state.processed_text = None
+
+        st.session_state.is_processed = True
+        st.rerun()
+
+# ---------------------------------------------------------------------------
+# Show processed content + Step 2: Query Document
+# ---------------------------------------------------------------------------
+if st.session_state.is_processed:
+    st.divider()
+    st.subheader("📄 Processed Content")
+
+    # Show a preview of what was extracted
+    if st.session_state.processed_text:
+        preview = st.session_state.processed_text
+        with st.expander("Extracted Text Preview", expanded=False):
+            st.text_area(
+                "Extracted text",
+                value=preview[:3000] + ("\n\n… (truncated)" if len(preview) > 3000 else ""),
+                height=250,
+                disabled=True,
+            )
+        method_label = "Text"
+    elif st.session_state.processed_images:
+        num_pages = len(st.session_state.processed_images)
+        st.success(f"✅ Converted {num_pages} page(s) to high-res images (Vision mode ready)")
+        with st.expander("Image Preview", expanded=False):
+            cols = st.columns(min(num_pages, 3))
+            for i, img_bytes in enumerate(st.session_state.processed_images[:6]):
+                cols[i % 3].image(img_bytes, caption=f"Page {i + 1}", use_container_width=True)
+            if num_pages > 6:
+                st.caption(f"… and {num_pages - 6} more page(s)")
+        method_label = "Vision"
+
+    # --- Query section (main area) ---
+    st.divider()
+    st.subheader("🔍 Query Document")
+
+    query_mode = st.radio(
+        "Query Mode",
+        ["Default JSON Extraction", "Manual Query"],
+        horizontal=True,
+    )
+
+    custom_prompt = None
+    if query_mode == "Default JSON Extraction":
+        st.caption(
+            "Will extract: **Customer Name**, **Contract ID**, **State**, **Term** as structured JSON."
+        )
+    else:
+        custom_prompt = st.text_area(
+            "Your prompt",
+            height=120,
+            placeholder="Ask anything about the document…",
+        )
+
+    if st.button("🧠 Query with LLM", type="primary", use_container_width=True):
         # --- Validations ---
         if not api_key:
             st.error("Please enter your API key in the sidebar.")
@@ -179,21 +257,6 @@ if uploaded_file is not None:
         json_mode = query_mode == "Default JSON Extraction"
         prompt = DEFAULT_JSON_SCHEMA_PROMPT if json_mode else (custom_prompt or "Summarize this document.")
 
-        text_content: str | None = None
-        image_list: list[bytes] | None = None
-
-        # --- Build payload ---
-        if doc_type == "Digital":
-            with st.spinner("Extracting text …"):
-                if extraction_method.startswith("pdfminer"):
-                    text_content = _cached_extract_pdfminer(pdf_bytes)
-                else:
-                    text_content = _cached_extract_pymupdf4llm(pdf_bytes)
-        else:
-            with st.spinner("Converting PDF to images …"):
-                image_list = _cached_pdf_to_images(pdf_bytes)
-
-        # --- Call LLM ---
         caller = PROVIDER_CALLERS[provider]
         with st.spinner(f"Calling {provider} ({model}) …"):
             try:
@@ -201,8 +264,8 @@ if uploaded_file is not None:
                     api_key=api_key,
                     model=model,
                     prompt=prompt,
-                    text_content=text_content,
-                    image_bytes_list=image_list,
+                    text_content=st.session_state.processed_text,
+                    image_bytes_list=st.session_state.processed_images,
                     json_mode=json_mode,
                 )
             except Exception as exc:
