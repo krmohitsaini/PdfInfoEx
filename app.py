@@ -91,20 +91,36 @@ if uploaded_file is None:
 if uploaded_file is not None:
     pdf_bytes: bytes = uploaded_file.getvalue()
 
-    doc_type, avg_chars = _cached_detect(pdf_bytes)
-    st.session_state.doc_type = doc_type
+    detected_type, avg_chars = _cached_detect(pdf_bytes)
     st.session_state.avg_chars = avg_chars
 
-    if doc_type == "Digital":
+    # Store the auto-detected value (only on first detection / new file)
+    if st.session_state.doc_type is None:
+        st.session_state.doc_type = detected_type
+
+    if detected_type == "Digital":
         st.success(
-            f"✅ Detected Document Type: **Digital** "
+            f"✅ Auto-Detected: **Digital** "
             f"(~{int(avg_chars)} chars on page 1)"
         )
     else:
         st.info(
-            f"🔍 Detected Document Type: **Scanned** "
+            f"🔍 Auto-Detected: **Scanned** "
             f"(~{int(avg_chars)} chars on page 1 — below threshold of 75)"
         )
+
+    # Override toggle
+    override = st.toggle(
+        "Override document type",
+        value=(st.session_state.doc_type != detected_type),
+        key="override_toggle",
+    )
+    if override:
+        opposite = "Scanned" if detected_type == "Digital" else "Digital"
+        st.session_state.doc_type = opposite
+        st.warning(f"⚠️ Overridden to: **{opposite}**")
+    else:
+        st.session_state.doc_type = detected_type
 
 doc_type = st.session_state.doc_type
 
