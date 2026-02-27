@@ -5,6 +5,8 @@ Each provider function accepts a unified interface and handles both
 text-based and vision-based (image) requests.
 """
 
+from __future__ import annotations
+
 import base64
 
 

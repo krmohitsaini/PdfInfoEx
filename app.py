@@ -5,6 +5,8 @@ Streamlit UI that orchestrates PDF detection, text/image extraction,
 token comparison, and LLM-based document processing.
 """
 
+from __future__ import annotations
+
 import json
 
 import streamlit as st
