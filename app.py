@@ -1,0 +1,225 @@
+"""
+PdfInfoEx – PDF Extraction & Testing Dashboard
+================================================
+Streamlit UI that orchestrates PDF detection, text/image extraction,
+token comparison, and LLM-based document processing.
+"""
+
+import json
+
+import streamlit as st
+
+from config import MODEL_MAP, DEFAULT_JSON_SCHEMA_PROMPT
+from core import (
+    detect_document_type,
+    extract_pdfminer,
+    extract_pymupdf4llm,
+    pdf_to_images,
+    estimate_text_tokens,
+    estimate_vision_tokens_for_images,
+    PROVIDER_CALLERS,
+)
+
+# ---------------------------------------------------------------------------
+# Page config
+# ---------------------------------------------------------------------------
+st.set_page_config(
+    page_title="PdfInfoEx – PDF Extraction Dashboard",
+    page_icon="📄",
+    layout="wide",
+)
+
+# ---------------------------------------------------------------------------
+# Cached wrappers (Streamlit cache decorators must live in the app module)
+# ---------------------------------------------------------------------------
+@st.cache_data(show_spinner=False)
+def _cached_detect(pdf_bytes: bytes):
+    return detect_document_type(pdf_bytes)
+
+@st.cache_data(show_spinner="Extracting with pdfminer.six …")
+def _cached_extract_pdfminer(pdf_bytes: bytes) -> str:
+    return extract_pdfminer(pdf_bytes)
+
+@st.cache_data(show_spinner="Extracting with pymupdf4llm …")
+def _cached_extract_pymupdf4llm(pdf_bytes: bytes) -> str:
+    return extract_pymupdf4llm(pdf_bytes)
+
+@st.cache_data(show_spinner="Converting pages to images …")
+def _cached_pdf_to_images(pdf_bytes: bytes) -> list[bytes]:
+    return pdf_to_images(pdf_bytes)
+
+# ---------------------------------------------------------------------------
+# UI: Title
+# ---------------------------------------------------------------------------
+st.title("📄 PdfInfoEx – PDF Extraction Dashboard")
+st.caption("Auto-detect PDF type · Compare extraction methods & tokens · Route to the right LLM")
+
+# ---------------------------------------------------------------------------
+# UI: File uploader
+# ---------------------------------------------------------------------------
+uploaded_file = st.file_uploader("Upload a PDF", type=["pdf"])
+
+# Session state defaults
+if "doc_type" not in st.session_state:
+    st.session_state.doc_type = None
+if "avg_chars" not in st.session_state:
+    st.session_state.avg_chars = 0.0
+
+# ---------------------------------------------------------------------------
+# Auto-detection on upload
+# ---------------------------------------------------------------------------
+if uploaded_file is not None:
+    pdf_bytes: bytes = uploaded_file.getvalue()
+
+    doc_type, avg_chars = _cached_detect(pdf_bytes)
+    st.session_state.doc_type = doc_type
+    st.session_state.avg_chars = avg_chars
+
+    if doc_type == "Digital":
+        st.success(
+            f"✅ Detected Document Type: **Digital** "
+            f"(~{int(avg_chars)} chars on page 1)"
+        )
+    else:
+        st.info(
+            f"🔍 Detected Document Type: **Scanned** "
+            f"(~{int(avg_chars)} chars on page 1 — below threshold of 75)"
+        )
+
+doc_type = st.session_state.doc_type
+
+# ---------------------------------------------------------------------------
+# UI: Sidebar configuration
+# ---------------------------------------------------------------------------
+with st.sidebar:
+    st.header("⚙️ Configuration")
+
+    provider = st.selectbox("LLM Provider", ["OpenAI", "Gemini", "Anthropic"])
+    api_key = st.text_input(f"{provider} API Key", type="password")
+
+    # Dynamic model selection
+    if doc_type:
+        recommended = MODEL_MAP[provider][doc_type]
+        st.selectbox("Model", [recommended], disabled=True, help="Auto-selected based on document type")
+    else:
+        st.selectbox("Model", ["Upload a PDF first"], disabled=True)
+
+    st.divider()
+
+    # Extraction method
+    if doc_type == "Digital":
+        extraction_method = st.radio(
+            "Extraction Method",
+            ["pdfminer.six (raw text)", "pymupdf4llm (Markdown)"],
+        )
+    elif doc_type == "Scanned":
+        st.radio(
+            "Extraction Method",
+            ["Vision Mode Enforced"],
+            disabled=True,
+            help="Scanned documents are sent as images to a Vision LLM.",
+        )
+        extraction_method = "vision"
+    else:
+        st.radio("Extraction Method", ["Upload a PDF first"], disabled=True)
+        extraction_method = None
+
+    st.divider()
+
+    # Query mode
+    query_mode = st.radio("Query Mode", ["Default JSON Extraction", "Manual Query"])
+    if query_mode == "Manual Query":
+        custom_prompt = st.text_area("Your prompt", height=120, placeholder="Ask anything about the document…")
+    else:
+        custom_prompt = None
+
+# ---------------------------------------------------------------------------
+# UI: Token comparison (expandable)
+# ---------------------------------------------------------------------------
+if uploaded_file is not None:
+    with st.expander("🔢 Token Comparison (local — no API call)", expanded=False):
+        if st.button("Calculate Comparative Token Usage"):
+            with st.spinner("Estimating tokens …"):
+                text_pdfminer = _cached_extract_pdfminer(pdf_bytes)
+                text_pymupdf = _cached_extract_pymupdf4llm(pdf_bytes)
+                images = _cached_pdf_to_images(pdf_bytes)
+
+                tok_pdfminer = estimate_text_tokens(text_pdfminer)
+                tok_pymupdf = estimate_text_tokens(text_pymupdf)
+                tok_vision = estimate_vision_tokens_for_images(images)
+
+            c1, c2, c3 = st.columns(3)
+            c1.metric("pdfminer.six", f"{tok_pdfminer:,} tokens")
+            c2.metric("pymupdf4llm", f"{tok_pymupdf:,} tokens")
+            c3.metric("Vision (high-res)", f"{tok_vision:,} tokens")
+
+            st.caption(
+                "Text tokens estimated via `tiktoken` (cl100k_base). "
+                "Vision tokens use OpenAI's high-res formula: 85 base + 170 × number of 512×512 tiles per page."
+            )
+
+# ---------------------------------------------------------------------------
+# UI: Process button & execution
+# ---------------------------------------------------------------------------
+if uploaded_file is not None:
+    st.divider()
+
+    if st.button("🚀 Process Document", type="primary", use_container_width=True):
+        # --- Validations ---
+        if not api_key:
+            st.error("Please enter your API key in the sidebar.")
+            st.stop()
+        if doc_type is None:
+            st.error("Document type not detected. Re-upload the PDF.")
+            st.stop()
+
+        model = MODEL_MAP[provider][doc_type]
+        json_mode = query_mode == "Default JSON Extraction"
+        prompt = DEFAULT_JSON_SCHEMA_PROMPT if json_mode else (custom_prompt or "Summarize this document.")
+
+        text_content: str | None = None
+        image_list: list[bytes] | None = None
+
+        # --- Build payload ---
+        if doc_type == "Digital":
+            with st.spinner("Extracting text …"):
+                if extraction_method.startswith("pdfminer"):
+                    text_content = _cached_extract_pdfminer(pdf_bytes)
+                else:
+                    text_content = _cached_extract_pymupdf4llm(pdf_bytes)
+        else:
+            with st.spinner("Converting PDF to images …"):
+                image_list = _cached_pdf_to_images(pdf_bytes)
+
+        # --- Call LLM ---
+        caller = PROVIDER_CALLERS[provider]
+        with st.spinner(f"Calling {provider} ({model}) …"):
+            try:
+                result = caller(
+                    api_key=api_key,
+                    model=model,
+                    prompt=prompt,
+                    text_content=text_content,
+                    image_bytes_list=image_list,
+                    json_mode=json_mode,
+                )
+            except Exception as exc:
+                st.error(f"API error: {exc}")
+                st.stop()
+
+        # --- Display result ---
+        st.subheader("📋 Extraction Result")
+
+        try:
+            parsed = json.loads(result)
+            st.json(parsed)
+            display_text = json.dumps(parsed, indent=2)
+        except (json.JSONDecodeError, TypeError):
+            st.code(result, language="text")
+            display_text = result
+
+        with st.expander("📎 Copy-friendly output"):
+            st.text_area("Result (select all → copy)", value=display_text, height=200)
+
+elif uploaded_file is None:
+    st.info("👆 Upload a PDF to get started.")
