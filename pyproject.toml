@@ -1,0 +1,17 @@
+[project]
+name = "pdfinfoex"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "anthropic>=0.89.0",
+    "google-genai>=1.70.0",
+    "openai>=2.30.0",
+    "pdfminer-six>=20260107",
+    "pillow>=12.2.0",
+    "pymupdf>=1.27.2.2",
+    "pymupdf4llm>=1.27.2.2",
+    "streamlit>=1.56.0",
+    "tiktoken>=0.12.0",
+]
